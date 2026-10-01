@@ -113,6 +113,63 @@ GET  /api/drills/{id}/evidence
 
 ---
 
+## 1d. 离线审计档案：增量见证与可恢复汇聚
+
+各区域/节点把审计日志导出为**签名链分段**（`source` 来源标识、`seq` 单调
+序号、`prev` 前序内容摘要、`payload_digest` 载荷摘要、来源 Ed25519 签名），
+汇聚器逐段验签、按来源重建哈希链，并在**独立来源门限**达标、全部纳入来源
+确认链连续且无未决冲突时形成可独立核验的**见证根**。新能力位于独立模块
+（`kc/archive.py`、`kc/archive_verify.py`、`kc/archive_server.py`、
+`kc/archive.html`），状态独立存于 `archive/state.json` 检查点。
+
+| 需求 | 实现方式 |
+|---|---|
+| **校验签名与链关系** | 每个分段对四字段规范化 JSON 验来源 Ed25519；链按 `prev == 上一确认内容摘要` 逐 seq 推进，seq 1 的 `prev` 为全零。签名失败分段不入链，原样保留在 `invalid_segments` 证据中并返回 `BAD_SIGNATURE`。 |
+| **乱序/重复/部分上传** | 未到前驱的分段作为候选持久化，缺口在视图中逐 seq 列出；前驱补齐后自动连续确认。完全相同的重复上传返回 `duplicate`，确认指针与计数不变（已确认分段绝不重复计入）。 |
+| **同序号不同内容即隔离** | 同一 `(source, seq)` 出现第二个**有效签名但内容不同**的版本时，立即把来源置 `isolated`、开启冲突单并保留每个版本的完整签名证据；确认状态**不被污染**（停留在原链尖），其他来源继续汇聚。 |
+| **持久化缺口/候选/确认位置** | 检查点 `archive/state.json` 记录每来源 `last_seq/last_digest/highest_seq`、全部候选版本、冲突单与历史发布；每次变更在共享 RLock + flock 内原子 rename 落盘。 |
+| **崩溃/重启续跑** | 新进程打开同一目录即从检查点继续；`recover` 对所有非隔离来源重跑推进：已确认不重复计入，缺前驱不越过。隔离状态与冲突证据同样跨重启保留（测试覆盖）。 |
+| **解除隔离须带理由的人工决策** | `resolve_conflict(conflict_id, accepted_digest, reason, decided_by)`，理由/决策人必填且必须选择证据中的版本。接受与当前确认不同的版本时，把冲突点及之后的确认**回滚**为 superseded，再从冲突点逐段重验链；不衔接的后续形成新缺口。拒绝版本永久留在证据，再次上传是幂等 `duplicate(rejected)`，不会重新隔离；但一个从未见过的第三版本仍会再次隔离。 |
+| **多工作进程收敛** | 所有变更在跨线程/跨进程排他锁内“加载最新→计算→落盘”；线程池 4 路与进程池 4 路并发乱序投喂同一批分段，最终各来源收敛到同一确认位置与同一档案根。 |
+| **门限 + 连续链 + 无未决冲突才能发布** | 发布前检查：非隔离且已确认 ≥1 的不同来源数 ≥ 配置门限（否则 `THRESHOLD_NOT_MET`，带 have/need）；全局不存在 OPEN 冲突（否则 `OPEN_CONFLICTS`）。 |
+| **CAS / 单次提交发布** | 发布在同一把全局锁内比较当前确认位置：赢家创建清单、根含轮次/门限/各来源头/`prev_root` 并把轮次 +1；并发的输家（或无新确认的重复发布）拿到**已发布根**（`race_lost:true`），绝不产生第二个根。8 线程/6 进程并发恰好 1 个赢家。 |
+| **迟到数据进下一轮、历史不可改写** | 发布后新确认属于下一轮，清单通过 `prev_root` 哈希链接；历史清单内嵌当轮全部已确认分段，之后再发布只追加不改写。 |
+| **网页 / HTTP 展示与操作** | `python3 -m kc.archive_server --root ./kc-data --port 8090`：仪表盘展示每来源缺口、冲突（含全部版本摘要）、确认位置、隔离状态、当前轮次与历史发布根；支持注册来源（可一次性返回来源签名种子）、粘贴/批量上传分段、带理由的冲突处置、重启恢复、CAS 发布观察（3 秒自动刷新）。 |
+| **离线验证器** | `python3 -m kc.archive_cli export --out bundle.json` 导出分段/检查点/冲突处置/发布清单；在无状态目录、无秘密的机器上 `python3 -m kc.archive_cli verify bundle.json` 重算所有来源链与每个见证根。明确检出：删段（`SEGMENT_DELETED`）、换段（`SEGMENT_SWAPPED`）、伪造签名（`FORGED_SIGNATURE`）、链断裂（`CHAIN_BROKEN`）、重复计入（`DOUBLE_COUNTED`）、越过缺口（`GAP_CROSSED`）、检查点不一致（`CHECKPOINT_MISMATCH`）、未决冲突下发布（`UNRESOLVED_PUBLISH`）、门限造假（`THRESHOLD_FALSIFIED`）、见证根篡改（`ROOT_TAMPERED`）、历史根被改写（`PREVIOUS_ROOT_REWRITTEN`）、无隔离记录的分叉（`CONFLICT_NOT_ISOLATED`）、处置后未重验链（`CONFLICT_CHAIN_FORK`）。每个历史清单按其**内嵌分段**独立重放，后续轮次增长不会冤枉旧快照。 |
+
+档案接口（独立端口，建议绑定隔离/气隙网络；面向区域导出器的机器对机器
+接口，默认无会话层）：
+
+```
+GET  /                                汇聚台页面
+GET  /api/archive/status              缺口/冲突/确认位置/隔离/轮次/发布根
+POST /api/archive/sources             {source, pubkey?}（省略 pubkey 则生成并一次性返回种子）
+POST /api/archive/threshold           {threshold}
+POST /api/archive/segments            单个分段或 {"segments":[...]}（可乱序/重复）
+POST /api/archive/conflicts/resolve   {conflict_id, accepted_digest, reason, by}
+POST /api/archive/recover             从检查点续跑
+POST /api/archive/publish             CAS 发布（失败方返回 race_lost + 已发布根）
+GET  /api/archive/publications        历史发布清单
+GET  /api/archive/bundle              导出供离线核验的完整证据包
+```
+
+命令行：
+
+```bash
+python3 -m kc.archive_cli init      --root ./kc-data --threshold 2
+python3 -m kc.archive_cli register  --root ./kc-data --source region-a   # 一次性返回种子
+python3 -m kc.archive_cli mksample  --out a.json --source region-a --seed <b64> --count 4
+python3 -m kc.archive_cli worker    a_late.json --root ./kc-data         # 独立工作进程
+python3 -m kc.archive_cli recover   --root ./kc-data
+python3 -m kc.archive_cli resolve   --root ./kc-data --conflict cfx-1 \
+    --accept <digest> --reason "带外核验通过" --by alice
+python3 -m kc.archive_cli publish   --root ./kc-data
+python3 -m kc.archive_cli export    --root ./kc-data --out bundle.json
+python3 -m kc.archive_cli verify    bundle.json
+```
+
+---
+
 
 ## 2. 目录结构
 
@@ -128,6 +185,10 @@ kc/
   regions.py      区域/命名空间/容量/隔离策略/恢复点清单（跨区域演练的区域模型）
   drills.py       灾备演练：修订方案、清单蓝图、分阶段幂等引擎、镜像对比、租约、受阻清理
   evidence.py     演练证据档案：签名清单 + 离线检查（伪造/跳探/重阶段/窗口外镜像/租约重叠）
+  archive.py      离线审计档案：签名链分段汇聚、缺口/候选/冲突隔离、检查点恢复、CAS 见证发布
+  archive_verify.py 档案离线验证器：删段/换段/伪造/断链/重复计入/越缺口/未决发布/根篡改
+  archive_server.py 档案 HTTP API + 汇聚台（archive.html）
+  archive_cli.py  档案命令行（init/register/mksample/worker/recover/resolve/publish/export/verify）
   sessions.py     终端证明登录：挑战/报价、绑定人员·职责·终端·时效的会话令牌
   authz.py        四眼授权单：冻结摘要/截止、互补职责矩阵、决策链、单次执行
   console.py      设备侧代理：证明→取件→验份额→签名确认
@@ -144,6 +205,9 @@ tests/
   test_authz.py       30 个会话/四眼测试（绑定、门禁、漂移、截止、撤销、并发单次、篡改导出）
   test_drills.py      37 个跨区域灾备演练场景（修订冲突、蓝图失效、分阶段崩溃续跑、
                       流量镜像隔离、差异冻结、租约竞争、回切幂等、受阻清理、证据篡改）
+  test_archive.py     35 个审计档案场景（乱序补齐、重复幂等、同序冲突隔离与处置、
+                      拒绝版本幂等、中断续跑、线程/进程收敛、门限拒绝、CAS 唯一发布、
+                      迟到数据进下一轮、离线验证正常通过与 12 类篡改失败、HTTP 全流程）
   http_e2e.py         HTTP 全流程含登录门禁、四类授权单、6 路并发批准、库直调不受限
   drill_http_e2e.py   演练 HTTP 全流程（区域/修订/扫描/续跑/镜像/冻结/租约/受阻清理/证据）
 ```
